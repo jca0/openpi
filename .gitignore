@@ -4,6 +4,7 @@ checkpoints/
 data/
 wandb/
 logs/
+datasets/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
