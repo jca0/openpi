@@ -77,8 +77,8 @@ uv run examples/droid/convert_droid_data_to_lerobot.py \
 
 # finetune openpi
 uv run scripts/train.py \
-  pi05_droid_finetune \
-  --exp-name=my_experiment \
+  pi05_droid_lora_finetune \
+  --exp-name=lora_finetune \
   --overwrite
 
 echo "JOB COMPLETED SUCCESSFULLY"
