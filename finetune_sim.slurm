@@ -31,17 +31,23 @@ export WANDB_DIR=$HOME_SCRATCH/wandb
 export HF_HOME=$HOME_SCRATCH/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 
-# Point LeRobot at the dataset bundled in the repo so that
-# repo_id="sim/droid" resolves to $PROJECT_DIR/data/lerobot/sim/droid
-export HF_LEROBOT_HOME=$PROJECT_DIR/data/lerobot
+# Point LeRobot at local cache; S3 data will be synced here
+export HF_LEROBOT_HOME=$HOME_SCRATCH/lerobot
+S3_DATA=s3://pi-sim-assets/lerobot/sim/droid
 
 mkdir -p \
   $HOME_SCRATCH \
   $WANDB_DIR \
   $HF_HOME \
+  $HF_LEROBOT_HOME/sim/droid \
   $PROJECT_DIR/logs
 
 cd $PROJECT_DIR
+
+# Download dataset from S3
+echo "Syncing dataset from $S3_DATA ..."
+aws s3 sync $S3_DATA $HF_LEROBOT_HOME/sim/droid
+echo "Dataset sync complete."
 
 uv lock --upgrade-package datasets
 uv sync
