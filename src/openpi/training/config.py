@@ -926,7 +926,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotDROIDDataConfig(
-            repo_id="your_hf_username/my_droid_dataset",
+            repo_id="sim/droid",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
