@@ -38,6 +38,7 @@ dependencies = [
     "rich>=14.0.0",
     "polars>=1.30.0",
     "datasets<3.0.0",
+    "awscli>=1.36.0",
 ]
 
 
