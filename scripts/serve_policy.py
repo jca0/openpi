@@ -51,6 +51,11 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Enable dynamic prompting: decompose tasks into subtasks and advance based on VLM feedback.
+    dynamic_prompting: bool = False
+    # How often (in env steps) to query the VLM for subtask completion checks.
+    check_every_n_steps: int = 15
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -99,6 +104,18 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    # Wrap with dynamic prompting if enabled.
+    if args.dynamic_prompting:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+
+        from openpi.dynamic_prompting import DynamicPromptingPolicy
+
+        logging.info("Dynamic prompting enabled (check_every_n_steps=%d)", args.check_every_n_steps)
+        policy = DynamicPromptingPolicy(policy, check_every_n_steps=args.check_every_n_steps)
+        policy_metadata = policy.metadata
 
     # Record the policy's behavior.
     if args.record:
