@@ -58,7 +58,8 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = await asyncio.to_thread(self._policy.infer, obs)
+                loop = asyncio.get_running_loop()
+                action = await loop.run_in_executor(None, self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

@@ -51,10 +51,14 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
-    # Enable dynamic prompting: decompose tasks into subtasks and advance based on VLM feedback.
+    # Dynamic prompting: decompose task into subtasks and advance automatically.
     dynamic_prompting: bool = False
-    # How often (in env steps) to query the VLM for subtask completion checks.
-    check_every_n_steps: int = 15
+    # Calibration: test N decomposition variations and log per-subtask success/failure.
+    calibration: bool = False
+    # Number of decomposition variations to test during calibration.
+    calibration_n_variations: int = 5
+    # How often (seconds) to query Gemini for subtask completion.
+    check_interval_sec: float = 1.0
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -105,21 +109,33 @@ def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
-    # Wrap with dynamic prompting if enabled.
-    if args.dynamic_prompting:
-        from dotenv import load_dotenv
-
-        load_dotenv()
-
-        from openpi.dynamic_prompting import DynamicPromptingPolicy
-
-        logging.info("Dynamic prompting enabled (check_every_n_steps=%d)", args.check_every_n_steps)
-        policy = DynamicPromptingPolicy(policy, check_every_n_steps=args.check_every_n_steps)
-        policy_metadata = policy.metadata
-
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
+
+    # Dynamic prompting / calibration wrappers.
+    if args.dynamic_prompting and args.calibration:
+        raise ValueError("Cannot use both --dynamic-prompting and --calibration at the same time")
+
+    if args.dynamic_prompting:
+        from openpi.dynamic_prompting.policy_wrapper import DynamicPromptingPolicy
+
+        logging.info("Dynamic prompting enabled (check interval: %.1fs)", args.check_interval_sec)
+        policy = DynamicPromptingPolicy(policy, check_interval_sec=args.check_interval_sec)
+
+    if args.calibration:
+        from openpi.dynamic_prompting.policy_wrapper import CalibrationPolicy
+
+        logging.info(
+            "Calibration enabled (variations: %d, check interval: %.1fs)",
+            args.calibration_n_variations,
+            args.check_interval_sec,
+        )
+        policy = CalibrationPolicy(
+            policy,
+            n_variations=args.calibration_n_variations,
+            check_interval_sec=args.check_interval_sec,
+        )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

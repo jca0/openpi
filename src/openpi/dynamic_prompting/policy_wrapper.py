@@ -1,132 +1,234 @@
 """
-Wraps a base policy with dynamic prompting: decomposes the high-level
-task into subtasks and advances through them based on VLM feedback.
+Policy wrappers that add dynamic prompting and calibration on top of a base policy.
 
-All Gemini API calls run in a background thread to avoid blocking the
-websocket handler (which would cause keepalive ping timeouts).
+These wrap the BasePolicy.infer() call to manage subtask progression and
+query Gemini at ~1Hz for completion checks. Gemini calls run in a background
+thread to avoid blocking the websocket server.
 """
 
+from __future__ import annotations
+
+import concurrent.futures
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 from openpi_client import base_policy as _base_policy
 from typing_extensions import override
 
 from openpi.dynamic_prompting.progress_monitor import ProgressMonitor
-from openpi.dynamic_prompting.subtask_manager import SubtaskManager, SubtaskPlan, decompose_task
+from openpi.dynamic_prompting.prompt_calibration import CalibrationLog
+from openpi.dynamic_prompting.prompt_calibration import generate_decomposition_variations
+from openpi.dynamic_prompting.subtask_manager import SubtaskManager
+from openpi.dynamic_prompting.subtask_manager import decompose_task
 
 logger = logging.getLogger(__name__)
 
-# Key in the raw observation dict that contains the exterior camera image.
-IMAGE_KEY = "observation/exterior_image_1_left"
+# Shared thread pool for background Gemini calls
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 class DynamicPromptingPolicy(_base_policy.BasePolicy):
-    """
-    Wraps a policy to replace the high-level prompt with the current
-    subtask instruction, advancing subtasks based on VLM progress checks.
+    """Wraps a policy to dynamically swap the prompt as subtasks complete.
 
-    The wrapper is stateful: it tracks the current subtask across calls
-    to infer(). When the client sends a new high-level prompt (different
-    from the previous one), the task is re-decomposed.
-
-    Gemini calls (decomposition + completion checks) are offloaded to a
-    background thread so they never block the websocket infer loop.
+    On first infer(), decomposes the high-level instruction into subtasks.
+    On each subsequent infer(), checks completion at ~1Hz in a background
+    thread and advances the subtask when done.
     """
 
     def __init__(
         self,
         policy: _base_policy.BasePolicy,
-        check_every_n_steps: int = 15,
+        check_interval_sec: float = 1.0,
     ):
         self._policy = policy
-        self._check_every_n_steps = check_every_n_steps
-
-        self._monitor = ProgressMonitor(check_every_n_steps=check_every_n_steps)
+        self._check_interval_sec = check_interval_sec
         self._manager: SubtaskManager | None = None
-        self._current_high_level_prompt: str | None = None
-
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._decompose_future: Future[SubtaskPlan] | None = None
-        self._check_future: Future[dict] | None = None
+        self._monitor: ProgressMonitor | None = None
+        self._instruction: str | None = None
+        self._pending_check: concurrent.futures.Future | None = None
 
     @override
     def infer(self, obs: dict) -> dict:
-        prompt = obs.get("prompt")
-        if prompt is not None:
-            if isinstance(prompt, bytes):
-                prompt = prompt.decode("utf-8")
-            elif isinstance(prompt, np.ndarray):
-                prompt = prompt.item()
+        instruction = obs.get("prompt", "")
 
-        # If the high-level prompt changed, kick off decomposition in background.
-        if prompt is not None and prompt != self._current_high_level_prompt:
-            self._current_high_level_prompt = prompt
-            self._manager = None
-            self._monitor.reset()
-            logger.info("Dynamic prompting: decomposing task in background: %s", prompt)
-            self._decompose_future = self._executor.submit(decompose_task, prompt)
+        # Initialize on first call or when instruction changes
+        if instruction and instruction != self._instruction:
+            self._instruction = instruction
+            logger.info("Decomposing task: %s", instruction)
+            plan = decompose_task(instruction)
+            logger.info("Subtasks: %s", plan.subtasks)
+            self._manager = SubtaskManager(plan)
+            self._monitor = ProgressMonitor(check_interval_sec=self._check_interval_sec)
 
-        # Check if background decomposition has finished.
-        if self._decompose_future is not None and self._decompose_future.done():
-            try:
-                plan = self._decompose_future.result()
-                self._manager = SubtaskManager(plan)
-                logger.info("Dynamic prompting: subtasks = %s", [s.instruction for s in plan.subtasks])
-            except Exception:
-                logger.exception("Dynamic prompting: decomposition failed")
-            self._decompose_future = None
+        # Collect result from background check if ready
+        self._process_pending_check()
 
-        # Feed camera frame to progress monitor.
-        if IMAGE_KEY in obs:
-            frame = np.asarray(obs[IMAGE_KEY])
-            if np.issubdtype(frame.dtype, np.floating):
-                frame = (255 * frame).astype(np.uint8)
-            self._monitor.set_frame(frame)
+        # Override the prompt with the current subtask
+        if self._manager and not self._manager.is_done():
+            obs = {**obs, "prompt": self._manager.current_instruction()}
 
-        # Replace prompt with current subtask instruction.
-        if self._manager is not None and not self._manager.is_done():
-            obs["prompt"] = self._manager.current_instruction()
-            self._manager.step()
-
-        # Run the real policy.
         result = self._policy.infer(obs)
 
-        # Check if a previous completion check has finished.
-        if self._check_future is not None and self._check_future.done():
-            try:
-                check = self._check_future.result()
-                logger.info("Dynamic prompting: %s | VLM check: %s",
-                            self._manager.status() if self._manager else "?", check)
-                if check["completed"] and self._manager is not None and not self._manager.is_done():
-                    self._manager.advance()
-                    if self._manager.is_done():
-                        logger.info("Dynamic prompting: all subtasks completed")
-                    else:
-                        logger.info("Dynamic prompting: advancing to %s", self._manager.status())
-            except Exception:
-                logger.exception("Dynamic prompting: completion check failed")
-            self._check_future = None
-
-        # Fire off a new completion check in the background if it's time.
-        if (
-            self._manager is not None
-            and not self._manager.is_done()
-            and self._check_future is None
-        ):
-            if self._monitor.should_check():
-                subtask_instruction = self._manager.current_instruction()
-                self._check_future = self._executor.submit(
-                    self._monitor.check_completion, subtask_instruction
-                )
-            elif self._manager.exceeded_subtask_limit():
-                logger.info("Dynamic prompting: subtask step limit exceeded, advancing")
-                self._manager.advance()
+        # Submit background completion check if it's time
+        if self._manager and self._monitor and not self._manager.is_done() and self._pending_check is None:
+            frame = _extract_frame(obs)
+            if frame is not None:
+                self._monitor.set_frame(frame)
+                if self._monitor.should_check():
+                    subtask = self._manager.current_instruction()
+                    self._pending_check = _executor.submit(self._monitor.check_completion, subtask)
 
         return result
 
-    @property
-    def metadata(self) -> dict:
-        base = self._policy.metadata if hasattr(self._policy, "metadata") else {}
-        return {**base, "dynamic_prompting": True}
+    def _process_pending_check(self):
+        if self._pending_check is None or not self._pending_check.done():
+            return
+        try:
+            check = self._pending_check.result()
+            if check["completed"]:
+                logger.info("Completed: %s | %s", self._manager.status(), check["reason"])
+                self._manager.advance()
+                if self._manager.is_done():
+                    logger.info("All subtasks completed")
+        except Exception:
+            logger.exception("Gemini completion check failed")
+        finally:
+            self._pending_check = None
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()
+        if self._pending_check:
+            self._pending_check.cancel()
+            self._pending_check = None
+        self._manager = None
+        self._monitor = None
+        self._instruction = None
+
+
+class CalibrationPolicy(_base_policy.BasePolicy):
+    """Wraps a policy to run prompt calibration.
+
+    Generates N decomposition variations, cycles through them across resets,
+    and logs per-subtask success/failure. Gemini calls run in a background thread.
+    """
+
+    def __init__(
+        self,
+        policy: _base_policy.BasePolicy,
+        n_variations: int = 5,
+        check_interval_sec: float = 1.0,
+        log_dir: str = "calibration_logs",
+    ):
+        self._policy = policy
+        self._n_variations = n_variations
+        self._check_interval_sec = check_interval_sec
+        self._cal_log = CalibrationLog(log_dir=log_dir)
+
+        self._plans: list | None = None
+        self._plan_index = 0
+        self._manager: SubtaskManager | None = None
+        self._monitor: ProgressMonitor | None = None
+        self._instruction: str | None = None
+        self._pending_check: concurrent.futures.Future | None = None
+
+    @override
+    def infer(self, obs: dict) -> dict:
+        instruction = obs.get("prompt", "")
+
+        # Generate decomposition variations on first call
+        if instruction and self._plans is None:
+            self._instruction = instruction
+            logger.info("Generating %d decomposition variations for: %s", self._n_variations, instruction)
+            self._plans = generate_decomposition_variations(instruction, n=self._n_variations)
+            for i, plan in enumerate(self._plans):
+                logger.info("  [%d] %s", i, plan.subtasks)
+            self._start_plan(self._plan_index)
+
+        # Collect result from background check if ready
+        self._process_pending_check()
+
+        # Override prompt with current subtask
+        if self._manager and not self._manager.is_done():
+            obs = {**obs, "prompt": self._manager.current_instruction()}
+
+        result = self._policy.infer(obs)
+
+        # Submit background completion check if it's time
+        if self._manager and self._monitor and not self._manager.is_done() and self._pending_check is None:
+            frame = _extract_frame(obs)
+            if frame is not None:
+                self._monitor.set_frame(frame)
+                if self._monitor.should_check():
+                    subtask = self._manager.current_instruction()
+                    self._pending_check = _executor.submit(self._monitor.check_completion, subtask)
+
+        return result
+
+    def _process_pending_check(self):
+        if self._pending_check is None or not self._pending_check.done():
+            return
+        try:
+            check = self._pending_check.result()
+            if check["completed"]:
+                logger.info("Subtask completed: %s | %s", self._manager.status(), check["reason"])
+                self._cal_log.log_subtask_result(
+                    instruction=self._instruction,
+                    subtask_prompt=self._manager.current_instruction(),
+                    completed=True,
+                    reason=check["reason"],
+                )
+                self._manager.advance()
+                if self._manager.is_done():
+                    logger.info("All subtasks completed for decomposition %d", self._plan_index)
+        except Exception:
+            logger.exception("Gemini completion check failed")
+        finally:
+            self._pending_check = None
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()
+
+        # Wait for any pending check before logging failures
+        if self._pending_check:
+            self._pending_check.cancel()
+            self._pending_check = None
+
+        # Log any remaining incomplete subtasks as failed
+        if self._manager:
+            while not self._manager.is_done():
+                self._cal_log.log_subtask_result(
+                    instruction=self._instruction,
+                    subtask_prompt=self._manager.current_instruction(),
+                    completed=False,
+                    reason="episode ended before completion",
+                )
+                self._manager.advance()
+
+        # Advance to next decomposition variation
+        if self._plans:
+            self._plan_index += 1
+            if self._plan_index < len(self._plans):
+                self._start_plan(self._plan_index)
+                logger.info("Starting decomposition %d/%d: %s", self._plan_index + 1, len(self._plans), self._plans[self._plan_index].subtasks)
+            else:
+                logger.info("Calibration complete. %s", self._cal_log.summary(self._instruction))
+                self._manager = None
+                self._monitor = None
+
+    def _start_plan(self, index: int):
+        self._manager = SubtaskManager(self._plans[index])
+        self._monitor = ProgressMonitor(check_interval_sec=self._check_interval_sec)
+
+
+def _extract_frame(obs: dict) -> np.ndarray | None:
+    """Try to extract an RGB camera frame from the observation dict."""
+    for key in ("image", "images", "external_cam", "agentview_rgb"):
+        if key in obs:
+            frame = obs[key]
+            if isinstance(frame, np.ndarray):
+                if frame.ndim == 4:
+                    frame = frame[0]
+                return frame
+    return None
