@@ -73,7 +73,6 @@ class ProgressMonitor:
         img_bytes = _image_to_bytes(img)
         image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
 
-        logger.info("Checking completion for subtask: \"%s\"", subtask)
         response = self.client.models.generate_content(
             model=self.model_id,
             contents=[image_part, prompt],
@@ -81,7 +80,8 @@ class ProgressMonitor:
         )
 
         result = _parse_response(response.text)
-        logger.info("VLM check result: completed=%s, reason=\"%s\"", result["completed"], result["reason"])
+        status = "DONE" if result["completed"] else "NOT DONE"
+        logger.info("[VLM] \"%s\" -> %s (%s)", subtask, status, result["reason"])
         return result
 
 
