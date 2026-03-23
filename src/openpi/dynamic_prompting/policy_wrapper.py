@@ -38,39 +38,34 @@ class DynamicPromptingPolicy(_base_policy.BasePolicy):
     def __init__(
         self,
         policy: _base_policy.BasePolicy,
+        instruction: str,
         check_interval_sec: float = 1.0,
     ):
         self._policy = policy
         self._check_interval_sec = check_interval_sec
-        self._manager: SubtaskManager | None = None
-        self._monitor: ProgressMonitor | None = None
-        self._instruction: str | None = None
         self._pending_check: concurrent.futures.Future | None = None
+
+        self._instruction = instruction
+        logger.info("[Dynamic Prompting] Task: \"%s\"", instruction)
+        plan = decompose_task(instruction)
+        logger.info("[Dynamic Prompting] Subtasks: %s", plan.subtasks)
+        self._manager = SubtaskManager(plan)
+        self._monitor = ProgressMonitor(check_interval_sec=check_interval_sec)
 
     @override
     def infer(self, obs: dict) -> dict:
-        instruction = obs.get("prompt", "")
-
-        # Initialize on first call or when instruction changes
-        if instruction and instruction != self._instruction:
-            self._instruction = instruction
-            logger.info("Decomposing task: %s", instruction)
-            plan = decompose_task(instruction)
-            logger.info("Subtasks: %s", plan.subtasks)
-            self._manager = SubtaskManager(plan)
-            self._monitor = ProgressMonitor(check_interval_sec=self._check_interval_sec)
 
         # Collect result from background check if ready
         self._process_pending_check()
 
         # Override the prompt with the current subtask
-        if self._manager and not self._manager.is_done():
+        if not self._manager.is_done():
             obs = {**obs, "prompt": self._manager.current_instruction()}
 
         result = self._policy.infer(obs)
 
         # Submit background completion check if it's time
-        if self._manager and self._monitor and not self._manager.is_done() and self._pending_check is None:
+        if not self._manager.is_done() and self._pending_check is None:
             frame = _extract_frame(obs)
             if frame is not None:
                 self._monitor.set_frame(frame)
@@ -86,12 +81,12 @@ class DynamicPromptingPolicy(_base_policy.BasePolicy):
         try:
             check = self._pending_check.result()
             if check["completed"]:
-                logger.info("Completed: %s | %s", self._manager.status(), check["reason"])
+                logger.info("[Dynamic Prompting] ADVANCED %s", self._manager.status())
                 self._manager.advance()
                 if self._manager.is_done():
-                    logger.info("All subtasks completed")
+                    logger.info("[Dynamic Prompting] ALL SUBTASKS COMPLETED")
         except Exception:
-            logger.exception("Gemini completion check failed")
+            logger.exception("[Dynamic Prompting] Gemini check failed")
         finally:
             self._pending_check = None
 
@@ -101,9 +96,9 @@ class DynamicPromptingPolicy(_base_policy.BasePolicy):
         if self._pending_check:
             self._pending_check.cancel()
             self._pending_check = None
-        self._manager = None
-        self._monitor = None
-        self._instruction = None
+        self._manager.reset()
+        self._monitor.reset()
+        logger.info("[Dynamic Prompting] Reset")
 
 
 class CalibrationPolicy(_base_policy.BasePolicy):
@@ -116,46 +111,37 @@ class CalibrationPolicy(_base_policy.BasePolicy):
     def __init__(
         self,
         policy: _base_policy.BasePolicy,
+        instruction: str,
         n_variations: int = 5,
         check_interval_sec: float = 1.0,
         log_dir: str = "calibration_logs",
     ):
         self._policy = policy
-        self._n_variations = n_variations
+        self._instruction = instruction
         self._check_interval_sec = check_interval_sec
         self._cal_log = CalibrationLog(log_dir=log_dir)
-
-        self._plans: list | None = None
-        self._plan_index = 0
-        self._manager: SubtaskManager | None = None
-        self._monitor: ProgressMonitor | None = None
-        self._instruction: str | None = None
         self._pending_check: concurrent.futures.Future | None = None
+
+        logger.info("[Calibration] Task: \"%s\" (%d variations)", instruction, n_variations)
+        self._plans = generate_decomposition_variations(instruction, n=n_variations)
+        for i, plan in enumerate(self._plans):
+            logger.info("[Calibration]   [%d] %s", i, plan.subtasks)
+        self._plan_index = 0
+        self._start_plan(0)
 
     @override
     def infer(self, obs: dict) -> dict:
-        instruction = obs.get("prompt", "")
-
-        # Generate decomposition variations on first call
-        if instruction and self._plans is None:
-            self._instruction = instruction
-            logger.info("Generating %d decomposition variations for: %s", self._n_variations, instruction)
-            self._plans = generate_decomposition_variations(instruction, n=self._n_variations)
-            for i, plan in enumerate(self._plans):
-                logger.info("  [%d] %s", i, plan.subtasks)
-            self._start_plan(self._plan_index)
-
         # Collect result from background check if ready
         self._process_pending_check()
 
         # Override prompt with current subtask
-        if self._manager and not self._manager.is_done():
+        if not self._manager.is_done():
             obs = {**obs, "prompt": self._manager.current_instruction()}
 
         result = self._policy.infer(obs)
 
         # Submit background completion check if it's time
-        if self._manager and self._monitor and not self._manager.is_done() and self._pending_check is None:
+        if not self._manager.is_done() and self._pending_check is None:
             frame = _extract_frame(obs)
             if frame is not None:
                 self._monitor.set_frame(frame)
@@ -171,7 +157,7 @@ class CalibrationPolicy(_base_policy.BasePolicy):
         try:
             check = self._pending_check.result()
             if check["completed"]:
-                logger.info("Subtask completed: %s | %s", self._manager.status(), check["reason"])
+                logger.info("[Calibration] ADVANCED %s", self._manager.status())
                 self._cal_log.log_subtask_result(
                     instruction=self._instruction,
                     subtask_prompt=self._manager.current_instruction(),
@@ -180,9 +166,9 @@ class CalibrationPolicy(_base_policy.BasePolicy):
                 )
                 self._manager.advance()
                 if self._manager.is_done():
-                    logger.info("All subtasks completed for decomposition %d", self._plan_index)
+                    logger.info("[Calibration] ALL SUBTASKS COMPLETED (decomposition %d/%d)", self._plan_index + 1, len(self._plans))
         except Exception:
-            logger.exception("Gemini completion check failed")
+            logger.exception("[Calibration] Gemini check failed")
         finally:
             self._pending_check = None
 
@@ -211,9 +197,9 @@ class CalibrationPolicy(_base_policy.BasePolicy):
             self._plan_index += 1
             if self._plan_index < len(self._plans):
                 self._start_plan(self._plan_index)
-                logger.info("Starting decomposition %d/%d: %s", self._plan_index + 1, len(self._plans), self._plans[self._plan_index].subtasks)
+                logger.info("[Calibration] Starting decomposition %d/%d: %s", self._plan_index + 1, len(self._plans), self._plans[self._plan_index].subtasks)
             else:
-                logger.info("Calibration complete. %s", self._cal_log.summary(self._instruction))
+                logger.info("[Calibration] COMPLETE\n%s", self._cal_log.summary(self._instruction))
                 self._manager = None
                 self._monitor = None
 
@@ -223,8 +209,25 @@ class CalibrationPolicy(_base_policy.BasePolicy):
 
 
 def _extract_frame(obs: dict) -> np.ndarray | None:
-    """Try to extract an RGB camera frame from the observation dict."""
-    for key in ("image", "images", "external_cam", "agentview_rgb"):
+    """Try to extract an RGB camera frame from the observation dict.
+
+    Searches for common image key patterns including DROID-style
+    'observation/exterior_image_1_left' keys.
+    """
+    # Try exact keys first, then search for image-like keys
+    candidates = [
+        "observation/exterior_image_1_left",
+        "image",
+        "images",
+        "external_cam",
+        "agentview_rgb",
+    ]
+    # Also match any key containing "image" or "cam"
+    for key in obs:
+        if ("image" in key.lower() or "cam" in key.lower()) and key not in candidates:
+            candidates.append(key)
+
+    for key in candidates:
         if key in obs:
             frame = obs[key]
             if isinstance(frame, np.ndarray):

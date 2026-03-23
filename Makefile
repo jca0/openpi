@@ -10,6 +10,7 @@ serve_pi05_droid_dynamic:
 	XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
 	uv run scripts/serve_policy.py \
 	--dynamic-prompting \
+	--default-prompt "$(PROMPT)" \
 	policy:checkpoint \
 	--policy.config=pi05_droid_jointpos_polaris \
 	--policy.dir=gs://openpi-assets/checkpoints/pi05_droid_jointpos
@@ -19,6 +20,7 @@ serve_pi05_droid_calibration:
 	uv run scripts/serve_policy.py \
 	--calibration \
 	--calibration-n-variations 5 \
+	--default-prompt "$(PROMPT)" \
 	policy:checkpoint \
 	--policy.config=pi05_droid_jointpos_polaris \
 	--policy.dir=gs://openpi-assets/checkpoints/pi05_droid_jointpos

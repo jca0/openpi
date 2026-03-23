@@ -120,19 +120,25 @@ def main(args: Args) -> None:
     if args.dynamic_prompting:
         from openpi.dynamic_prompting.policy_wrapper import DynamicPromptingPolicy
 
-        logging.info("Dynamic prompting enabled (check interval: %.1fs)", args.check_interval_sec)
-        policy = DynamicPromptingPolicy(policy, check_interval_sec=args.check_interval_sec)
+        if not args.default_prompt:
+            raise ValueError("--default-prompt is required when using --dynamic-prompting")
+        logging.info("Dynamic prompting enabled (prompt: %s, check interval: %.1fs)", args.default_prompt, args.check_interval_sec)
+        policy = DynamicPromptingPolicy(policy, instruction=args.default_prompt, check_interval_sec=args.check_interval_sec)
 
     if args.calibration:
         from openpi.dynamic_prompting.policy_wrapper import CalibrationPolicy
 
+        if not args.default_prompt:
+            raise ValueError("--default-prompt is required when using --calibration")
         logging.info(
-            "Calibration enabled (variations: %d, check interval: %.1fs)",
+            "Calibration enabled (prompt: %s, variations: %d, check interval: %.1fs)",
+            args.default_prompt,
             args.calibration_n_variations,
             args.check_interval_sec,
         )
         policy = CalibrationPolicy(
             policy,
+            instruction=args.default_prompt,
             n_variations=args.calibration_n_variations,
             check_interval_sec=args.check_interval_sec,
         )
@@ -152,4 +158,7 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
+    # Suppress noisy loggers
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     main(tyro.cli(Args))
