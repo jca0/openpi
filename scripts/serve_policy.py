@@ -44,7 +44,7 @@ class Args:
 
     # If provided, will be used in case the "prompt" key is not present in the data, or if the model doesn't have a default
     # prompt.
-    default_prompt: str | None = None
+    prompt: str | None = None
 
     # Port to serve the policy on.
     port: int = 8000
@@ -99,10 +99,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.prompt
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.prompt)
 
 
 def main(args: Args) -> None:
@@ -120,25 +120,25 @@ def main(args: Args) -> None:
     if args.dynamic_prompting:
         from openpi.dynamic_prompting.policy_wrapper import DynamicPromptingPolicy
 
-        if not args.default_prompt:
-            raise ValueError("--default-prompt is required when using --dynamic-prompting")
-        logging.info("Dynamic prompting enabled (prompt: %s, check interval: %.1fs)", args.default_prompt, args.check_interval_sec)
-        policy = DynamicPromptingPolicy(policy, instruction=args.default_prompt, check_interval_sec=args.check_interval_sec)
+        if not args.prompt:
+            raise ValueError("--prompt is required when using --dynamic-prompting")
+        logging.info("Dynamic prompting enabled (prompt: %s, check interval: %.1fs)", args.prompt, args.check_interval_sec)
+        policy = DynamicPromptingPolicy(policy, instruction=args.prompt, check_interval_sec=args.check_interval_sec)
 
     if args.calibration:
         from openpi.dynamic_prompting.policy_wrapper import CalibrationPolicy
 
-        if not args.default_prompt:
-            raise ValueError("--default-prompt is required when using --calibration")
+        if not args.prompt:
+            raise ValueError("--prompt is required when using --calibration")
         logging.info(
             "Calibration enabled (prompt: %s, variations: %d, check interval: %.1fs)",
-            args.default_prompt,
+            args.prompt,
             args.calibration_n_variations,
             args.check_interval_sec,
         )
         policy = CalibrationPolicy(
             policy,
-            instruction=args.default_prompt,
+            instruction=args.prompt,
             n_variations=args.calibration_n_variations,
             check_interval_sec=args.check_interval_sec,
         )
