@@ -70,58 +70,86 @@ def generate_decomposition_variations(
 def _instruction_slug(instruction: str) -> str:
     """Create a filesystem-safe slug from an instruction string."""
     short = instruction[:50].strip().replace(" ", "_")
-    # Append a short hash to avoid collisions
     h = hashlib.md5(instruction.encode()).hexdigest()[:8]
     safe = "".join(c for c in short if c.isalnum() or c == "_")
     return f"{safe}_{h}"
 
 
 class CalibrationLog:
-    """Tracks which individual subtask prompts succeeded or failed."""
+    """Accumulates all episodes from a single calibration run into one structured log.
+
+    Call `start_episode` at the beginning of each decomposition variation,
+    `log_subtask_result` for each subtask, and `finalize` at the end of the
+    full run to write the log and the success/failure prompt files.
+    """
 
     def __init__(self, log_dir: str = "calibration_logs"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._instruction: str | None = None
+        self._episodes: list[dict] = []
+        self._current_episode: dict | None = None
 
-    def _log_path(self, instruction: str) -> Path:
-        return self.log_dir / f"{_instruction_slug(instruction)}.json"
+    def start_episode(self, instruction: str, subtasks: list[str]):
+        """Begin a new episode (decomposition variation)."""
+        self._instruction = instruction
+        self._current_episode = {
+            "subtasks": subtasks,
+            "results": [],
+        }
+        self._episodes.append(self._current_episode)
 
-    def load(self, instruction: str) -> list[dict]:
-        path = self._log_path(instruction)
-        if path.exists():
-            return json.loads(path.read_text())
-        return []
-
-    def log_subtask_result(
-        self,
-        instruction: str,
-        subtask_prompt: str,
-        completed: bool,
-        reason: str,
-    ):
-        entries = self.load(instruction)
-        entries.append({
-            "timestamp": datetime.now().isoformat(),
+    def log_subtask_result(self, subtask_prompt: str, completed: bool, reason: str):
+        """Record the outcome of a single subtask within the current episode."""
+        self._current_episode["results"].append({
             "subtask_prompt": subtask_prompt,
             "completed": completed,
             "reason": reason,
         })
-        self._log_path(instruction).write_text(json.dumps(entries, indent=2))
 
-    def get_successful_prompts(self, instruction: str) -> list[dict]:
-        return [e for e in self.load(instruction) if e["completed"]]
+    def finalize(self):
+        """Write the full run log plus separate success/failure prompt files."""
+        if not self._instruction or not self._episodes:
+            return
 
-    def get_failed_prompts(self, instruction: str) -> list[dict]:
-        return [e for e in self.load(instruction) if not e["completed"]]
+        slug = _instruction_slug(self._instruction)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = self.log_dir / f"{slug}_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    def summary(self, instruction: str) -> str:
-        entries = self.load(instruction)
-        if not entries:
-            return f'"{instruction}": no calibration data'
-        successes = sum(1 for e in entries if e["completed"])
-        total = len(entries)
-        lines = [f'"{instruction}": {successes}/{total} subtask prompts successful']
-        for e in entries:
-            status = "OK" if e["completed"] else "FAIL"
-            lines.append(f'  [{status}] "{e["subtask_prompt"]}"')
+        # Full structured log
+        run_data = {
+            "timestamp": datetime.now().isoformat(),
+            "instruction": self._instruction,
+            "episodes": self._episodes,
+        }
+        (run_dir / "run.json").write_text(json.dumps(run_data, indent=2))
+
+        # Collect unique successful and failed subtask prompts
+        successful = []
+        failed = []
+        for episode in self._episodes:
+            for result in episode["results"]:
+                if result["completed"]:
+                    successful.append(result["subtask_prompt"])
+                else:
+                    failed.append(result["subtask_prompt"])
+
+        (run_dir / "successful_prompts.json").write_text(json.dumps(successful, indent=2))
+        (run_dir / "failed_prompts.json").write_text(json.dumps(failed, indent=2))
+
+        logger.info("[Calibration] Logs written to %s", run_dir)
+
+    def summary(self) -> str:
+        if not self._instruction or not self._episodes:
+            return "No calibration data"
+        all_results = [r for ep in self._episodes for r in ep["results"]]
+        successes = sum(1 for r in all_results if r["completed"])
+        total = len(all_results)
+        lines = [f'"{self._instruction}": {successes}/{total} subtask prompts successful']
+        for i, ep in enumerate(self._episodes):
+            lines.append(f"  Episode {i}: {ep['subtasks']}")
+            for r in ep["results"]:
+                status = "OK" if r["completed"] else "FAIL"
+                lines.append(f'    [{status}] "{r["subtask_prompt"]}" — {r["reason"]}')
         return "\n".join(lines)

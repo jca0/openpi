@@ -128,6 +128,7 @@ class CalibrationPolicy(_base_policy.BasePolicy):
             logger.info("[Calibration]   [%d] %s", i, plan.subtasks)
         self._plan_index = 0
         self._start_plan(0)
+        self._cal_log.start_episode(instruction, self._plans[0].subtasks)
 
     @override
     def infer(self, obs: dict) -> dict:
@@ -159,7 +160,6 @@ class CalibrationPolicy(_base_policy.BasePolicy):
             if check["completed"]:
                 logger.info("[Calibration] ADVANCED %s", self._manager.status())
                 self._cal_log.log_subtask_result(
-                    instruction=self._instruction,
                     subtask_prompt=self._manager.current_instruction(),
                     completed=True,
                     reason=check["reason"],
@@ -185,7 +185,6 @@ class CalibrationPolicy(_base_policy.BasePolicy):
         if self._manager:
             while not self._manager.is_done():
                 self._cal_log.log_subtask_result(
-                    instruction=self._instruction,
                     subtask_prompt=self._manager.current_instruction(),
                     completed=False,
                     reason="episode ended before completion",
@@ -197,9 +196,11 @@ class CalibrationPolicy(_base_policy.BasePolicy):
             self._plan_index += 1
             if self._plan_index < len(self._plans):
                 self._start_plan(self._plan_index)
+                self._cal_log.start_episode(self._instruction, self._plans[self._plan_index].subtasks)
                 logger.info("[Calibration] Starting decomposition %d/%d: %s", self._plan_index + 1, len(self._plans), self._plans[self._plan_index].subtasks)
             else:
-                logger.info("[Calibration] COMPLETE\n%s", self._cal_log.summary(self._instruction))
+                self._cal_log.finalize()
+                logger.info("[Calibration] COMPLETE\n%s", self._cal_log.summary())
                 self._manager = None
                 self._monitor = None
 
