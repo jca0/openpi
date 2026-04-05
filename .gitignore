@@ -5,6 +5,7 @@ data/
 wandb/
 datasets/
 slurm/
+calibration_logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
